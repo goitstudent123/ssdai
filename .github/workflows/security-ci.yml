@@ -202,9 +202,18 @@ jobs:
           done
           curl -fsS http://localhost:5000/ || (docker logs app && exit 1)
       - name: OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.13.0
+        run: |
+          mkdir -p zap-out && chmod 777 zap-out
+          docker run --rm --network=host \
+            -v "$(pwd)/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:5000 -I -a \
+            -r zap-report.html -J zap-report.json || true
+          echo "=== ZAP scan complete ==="
+          ls -la zap-out/
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          target: http://localhost:5000
-          fail_action: false
-          allow_issue_writing: false
-          cmd_options: '-I -a'
+          name: zap-baseline-report
+          path: zap-out/
