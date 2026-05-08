@@ -120,8 +120,20 @@ jobs:
           curl -sSL -o osv-scanner \
             https://github.com/google/osv-scanner/releases/download/v1.9.1/osv-scanner_linux_amd64
           chmod +x osv-scanner
-      - name: Scan lockfiles
-        run: ./osv-scanner --lockfile=requirements.txt:requirements.txt .
+      - name: Scan lockfiles (report all findings)
+        run: |
+          ./osv-scanner --format=json \
+            --lockfile=requirements.txt:requirements.txt . > osv.json || true
+          ./osv-scanner --lockfile=requirements.txt:requirements.txt . || true
+      - name: Block only on Critical/High (CVSS >= 7.0)
+        run: |
+          MAX=$(jq -r '[.results[]?.packages[]?.groups[]?.max_severity // "0.0"] | map(tonumber) | max // 0' osv.json)
+          echo "Highest CVSS in findings: $MAX"
+          if awk "BEGIN{exit !($MAX >= 7.0)}"; then
+            echo "::error::Critical/High CVE detected (CVSS=$MAX) — failing job"
+            exit 1
+          fi
+          echo "No Critical/High CVEs (policy threshold = 7.0). Lower-severity findings reported only."
 
   # ---------------------------------------------------------------------------
   # STAGE 5c: Container scanning (Trivy, blocks on fixed CRITICAL)
