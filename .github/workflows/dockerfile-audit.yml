@@ -1,0 +1,142 @@
+name: Dockerfile Security Audit
+
+# Runs Hadolint, Trivy config and Dockle against both the intentionally
+# insecure Dockerfile.bad and the hardened Dockerfile.good in dockerlab/,
+# producing a side-by-side proof of the controls these tools enforce.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dockerlab/**"
+      - ".github/workflows/dockerfile-audit.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "dockerlab/**"
+      - ".github/workflows/dockerfile-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  hadolint:
+    name: Hadolint (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [bad, good]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hadolint scan
+        id: scan
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: dockerlab/Dockerfile.${{ matrix.variant }}
+          format: tty
+          # No-fail for the "bad" variant so the workflow finishes and
+          # produces evidence for the homework. "good" must stay clean.
+          no-fail: ${{ matrix.variant == 'bad' }}
+          failure-threshold: error
+      - name: Hadolint SARIF (for Security tab)
+        if: always()
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: dockerlab/Dockerfile.${{ matrix.variant }}
+          format: sarif
+          output-file: hadolint-${{ matrix.variant }}.sarif
+          no-fail: true
+      - if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint-${{ matrix.variant }}.sarif
+          category: hadolint-${{ matrix.variant }}
+
+  trivy-config:
+    name: Trivy Config (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [bad, good]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | \
+            sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | \
+            sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -y && sudo apt-get install -y trivy
+      - name: Trivy config (table)
+        run: trivy config dockerlab/Dockerfile.${{ matrix.variant }}
+      - name: Trivy config (SARIF)
+        if: always()
+        run: |
+          trivy config --format sarif --output trivy-config-${{ matrix.variant }}.sarif \
+            dockerlab/Dockerfile.${{ matrix.variant }} || true
+      - if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-config-${{ matrix.variant }}.sarif
+          category: trivy-config-${{ matrix.variant }}
+      - name: Block on HIGH/CRITICAL (good must stay clean)
+        if: matrix.variant == 'good'
+        run: trivy config --severity HIGH,CRITICAL --exit-code 1 dockerlab/Dockerfile.good
+
+  dockle:
+    name: Dockle (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [bad, good]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: |
+          docker build -t dockerlab-${{ matrix.variant }}:ci \
+            -f dockerlab/Dockerfile.${{ matrix.variant }} dockerlab/
+      - name: Save image to tar (for offline Dockle)
+        run: docker save dockerlab-${{ matrix.variant }}:ci -o image.tar
+      - name: Dockle scan (human readable)
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work goodwithtech/dockle:latest \
+            --no-color --input image.tar
+        continue-on-error: ${{ matrix.variant == 'bad' }}
+      - name: Dockle scan (JSON report)
+        if: always()
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work goodwithtech/dockle:latest \
+            --no-color --format json --output dockle-${{ matrix.variant }}.json \
+            --input image.tar || true
+      - name: Upload Dockle report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dockle-${{ matrix.variant }}-report
+          path: dockle-${{ matrix.variant }}.json
+
+  summary:
+    name: Audit Summary
+    runs-on: ubuntu-latest
+    needs: [hadolint, trivy-config, dockle]
+    if: always()
+    steps:
+      - name: Render summary
+        run: |
+          {
+            echo "## Dockerfile Security Audit Summary"
+            echo
+            echo "| Tool | Dockerfile.bad | Dockerfile.good |"
+            echo "| --- | --- | --- |"
+            echo "| Hadolint     | ${{ needs.hadolint.result }} (matrix bad+good) | — |"
+            echo "| Trivy config | ${{ needs.trivy-config.result }} (matrix bad+good) | — |"
+            echo "| Dockle       | ${{ needs.dockle.result }} (matrix bad+good) | — |"
+            echo
+            echo "Bad jobs are allowed to surface findings; good jobs must stay clean."
+          } >> "$GITHUB_STEP_SUMMARY"
